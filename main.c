@@ -31,6 +31,7 @@ void generate_huffman_table(Node* root, HuffmanTable* table, char* code, int len
 void compress_file(const char* input_file, const char* output_file);
 void decompress_file(const char* input_file, const char* output_file);
 void free_huffman_tree(Node* root);
+void show_progress(unsigned long long processed, unsigned long long total, const char* action);
 
 PriorityQueue* create_priority_queue();
 void priority_queue_push(PriorityQueue* pq, Node* node);
@@ -142,6 +143,13 @@ void generate_huffman_table(Node* root, HuffmanTable* table, char* code, int len
     }
 }
 
+// Display progress
+void show_progress(unsigned long long processed, unsigned long long total, const char* action) {
+    int progress = (int)((processed * 100) / total);
+    printf("\r%s: %d%%", action, progress);
+    fflush(stdout);
+}
+
 // Write a bit to the output file
 void write_bit(FILE* file, int bit, unsigned char* buffer, int* bit_pos) {
     if (bit)
@@ -158,6 +166,7 @@ void write_bit(FILE* file, int bit, unsigned char* buffer, int* bit_pos) {
 void flush_bits(FILE* file, unsigned char* buffer, int* bit_pos) {
     if (*bit_pos > 0) {
         fwrite(buffer, 1, 1, file);
+        *bit_pos = 0;
     }
 }
 
@@ -210,6 +219,7 @@ void compress_file(const char* input_file, const char* output_file) {
     rewind(in);
     unsigned char bit_buffer = 0;
     int bit_pos = 0;
+    unsigned long long bytes_processed = 0;
 
     while (fread(buffer, 1, 1, in)) {
         char* code = table.codes[buffer[0]];
@@ -218,9 +228,15 @@ void compress_file(const char* input_file, const char* output_file) {
         for (int i = 0; i < length; i++) {
             write_bit(out, code[i] - '0', &bit_buffer, &bit_pos);
         }
+
+        bytes_processed++;
+        if (bytes_processed % 1024 == 0 || bytes_processed == input_size) {
+            show_progress(bytes_processed, input_size, "Compressing");
+        }
     }
 
     flush_bits(out, &bit_buffer, &bit_pos);
+    printf("\n");
     free_huffman_tree(root);
 
     fclose(in);
@@ -266,9 +282,14 @@ void decompress_file(const char* input_file, const char* output_file) {
             fwrite(&current->symbol, 1, 1, out);
             current = root;
             decoded++;
+
+            if (decoded % 1024 == 0 || decoded == input_size) {
+                show_progress(decoded, input_size, "Decompressing");
+            }
         }
     }
 
+    printf("\n");
     free_huffman_tree(root);
     fclose(in);
     fclose(out);
