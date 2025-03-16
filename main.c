@@ -298,6 +298,11 @@ void decompress_file(const char* input_file, const char* output_file) {
         return;
     }
 
+    // Get the size of the input file
+    fseek(in, 0, SEEK_END);
+    size_t input_file_size = ftell(in);
+    rewind(in);
+
     unsigned int frequencies[MAX_SYMBOLS] = {0};
     fread(frequencies, sizeof(unsigned int), MAX_SYMBOLS, in);
 
@@ -309,6 +314,12 @@ void decompress_file(const char* input_file, const char* output_file) {
 
     Node* current = root;
     size_t processed = 0;
+
+    // Estimate the total number of bytes to decompress based on frequencies
+    size_t total_bytes_to_decompress = 0;
+    for (int i = 0; i < MAX_SYMBOLS; i++) {
+        total_bytes_to_decompress += frequencies[i];
+    }
 
     while (1) {
         int bit = read_bit(in, &bit_buffer, &bit_pos, &buffer_size);
@@ -322,8 +333,8 @@ void decompress_file(const char* input_file, const char* output_file) {
             processed++;
 
             // Show progress
-            if (processed % (CHUNK_SIZE / 100) == 0) {
-                show_progress("Decompressing", processed, CHUNK_SIZE);
+            if (processed % (total_bytes_to_decompress / 100) == 0) {
+                show_progress("Decompressing", processed, total_bytes_to_decompress);
             }
         }
     }
