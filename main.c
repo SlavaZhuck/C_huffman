@@ -2,8 +2,12 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <pthread.h>
+#include <unistd.h> // For usleep()
 
-#define MAX_SYMBOLS 256 // Number of possible byte values (0-255)
+#define MAX_SYMBOLS 256       // Number of possible byte values (0-255)
+#define THREAD_COUNT 12        // Number of threads to use for multithreading
+#define CHUNK_SIZE (2048 * 1024) // Process 512 KB chunks to support large files
 
 // Node structure for Huffman Tree
 typedef struct Node {
@@ -25,19 +29,34 @@ typedef struct {
     int lengths[MAX_SYMBOLS];             // Lengths of the codes for each symbol
 } HuffmanTable;
 
+// Frequency counting job structure for multithreading
+typedef struct {
+    unsigned int frequencies[MAX_SYMBOLS];
+    unsigned char* data;
+    size_t start;
+    size_t end;
+} FrequencyJob;
+
+
+
 // Function prototypes
 Node* build_huffman_tree(unsigned int frequencies[]);
 void generate_huffman_table(Node* root, HuffmanTable* table, char* code, int length);
 void compress_file(const char* input_file, const char* output_file);
 void decompress_file(const char* input_file, const char* output_file);
 void free_huffman_tree(Node* root);
-void show_progress(unsigned long long processed, unsigned long long total, const char* action);
+void show_progress(const char* action, unsigned long long processed, unsigned long long total);
+
 
 PriorityQueue* create_priority_queue();
 void priority_queue_push(PriorityQueue* pq, Node* node);
 Node* priority_queue_pop(PriorityQueue* pq);
 
-// I/O Bit-level functions
+
+void* count_frequencies_thread(void* arg);
+void merge_frequencies(unsigned int global_freq[], unsigned int local_freq[]);
+
+void show_progress(const char* action, unsigned long long processed, unsigned long long total);
 void write_bit(FILE* file, int bit, unsigned char* buffer, int* bit_pos);
 void flush_bits(FILE* file, unsigned char* buffer, int* bit_pos);
 int read_bit(FILE* file, unsigned char* buffer, int* bit_pos, int* buffer_size);
@@ -144,11 +163,28 @@ void generate_huffman_table(Node* root, HuffmanTable* table, char* code, int len
 }
 
 // Display progress
-void show_progress(unsigned long long processed, unsigned long long total, const char* action) {
+void show_progress(const char* action, unsigned long long processed, unsigned long long total) {
     int progress = (int)((processed * 100) / total);
     printf("\r%s: %d%%", action, progress);
     fflush(stdout);
 }
+
+void* count_frequencies_thread(void* arg) {
+    FrequencyJob* job = (FrequencyJob*)arg;
+
+    for (size_t i = job->start; i < job->end; i++) {
+        job->frequencies[job->data[i]]++;
+    }
+
+    return NULL;
+}
+
+void merge_frequencies(unsigned int global_freq[], unsigned int local_freq[]) {
+    for (int i = 0; i < MAX_SYMBOLS; i++) {
+        global_freq[i] += local_freq[i];
+    }
+}
+
 
 // Write a bit to the output file
 void write_bit(FILE* file, int bit, unsigned char* buffer, int* bit_pos) {
@@ -193,18 +229,30 @@ void compress_file(const char* input_file, const char* output_file) {
         return;
     }
 
-    // Build frequency table
-    unsigned int frequencies[MAX_SYMBOLS] = {0};
-    unsigned char buffer[1];
-    unsigned long long input_size = 0;
+    fseek(in, 0, SEEK_END);
+    size_t file_size = ftell(in);
+    rewind(in);
 
-    while (fread(buffer, 1, 1, in)) {
-        frequencies[buffer[0]]++;
-        input_size++;
+    unsigned char* data = (unsigned char*)malloc(file_size);
+    fread(data, 1, file_size, in);
+
+    unsigned int frequencies[MAX_SYMBOLS] = {0};
+    pthread_t threads[THREAD_COUNT];
+    FrequencyJob jobs[THREAD_COUNT];
+
+    size_t chunk_size = file_size / THREAD_COUNT;
+    for (int i = 0; i < THREAD_COUNT; i++) {
+        jobs[i].data = data;
+        jobs[i].start = i * chunk_size;
+        jobs[i].end = (i == THREAD_COUNT - 1) ? file_size : (i + 1) * chunk_size;
+        memset(jobs[i].frequencies, 0, sizeof(jobs[i].frequencies));
+        pthread_create(&threads[i], NULL, count_frequencies_thread, &jobs[i]);
     }
 
-    // Write input file size to the output file
-    fwrite(&input_size, sizeof(input_size), 1, out);
+    for (int i = 0; i < THREAD_COUNT; i++) {
+        pthread_join(threads[i], NULL);
+        merge_frequencies(frequencies, jobs[i].frequencies);
+    }
 
     // Build Huffman tree
     Node* root = build_huffman_tree(frequencies);
@@ -213,37 +261,34 @@ void compress_file(const char* input_file, const char* output_file) {
     generate_huffman_table(root, &table, code, 0);
 
     // Write frequency table to the output file
-    fwrite(frequencies, sizeof(frequencies), 1, out);
+    fwrite(frequencies, sizeof(unsigned int), MAX_SYMBOLS, out);
 
-    // Write encoded data
-    rewind(in);
     unsigned char bit_buffer = 0;
     int bit_pos = 0;
-    unsigned long long bytes_processed = 0;
 
-    while (fread(buffer, 1, 1, in)) {
-        char* code = table.codes[buffer[0]];
-        int length = table.lengths[buffer[0]];
+    for (size_t i = 0; i < file_size; i++) {
+        char* code = table.codes[data[i]];
+        int length = table.lengths[data[i]];
 
-        for (int i = 0; i < length; i++) {
-            write_bit(out, code[i] - '0', &bit_buffer, &bit_pos);
+        for (int j = 0; j < length; j++) {
+            write_bit(out, code[j] - '0', &bit_buffer, &bit_pos);
         }
 
-        bytes_processed++;
-        if (bytes_processed % 1024 == 0 || bytes_processed == input_size) {
-            show_progress(bytes_processed, input_size, "Compressing");
+        // Show progress
+        if (i % (file_size / 100) == 0) {
+            show_progress("Compressing", i, file_size);
         }
     }
 
     flush_bits(out, &bit_buffer, &bit_pos);
-    printf("\n");
+    free(data);
     free_huffman_tree(root);
 
     fclose(in);
     fclose(out);
+    printf("\nCompression Complete.\n");
 }
 
-// Decompress a file
 void decompress_file(const char* input_file, const char* output_file) {
     FILE* in = fopen(input_file, "rb");
     FILE* out = fopen(output_file, "wb");
@@ -253,46 +298,41 @@ void decompress_file(const char* input_file, const char* output_file) {
         return;
     }
 
-    // Read input file size
-    unsigned long long input_size;
-    fread(&input_size, sizeof(input_size), 1, in);
+    unsigned int frequencies[MAX_SYMBOLS] = {0};
+    fread(frequencies, sizeof(unsigned int), MAX_SYMBOLS, in);
 
-    // Read frequency table
-    unsigned int frequencies[MAX_SYMBOLS];
-    fread(frequencies, sizeof(frequencies), 1, in);
-
-    // Rebuild Huffman tree
     Node* root = build_huffman_tree(frequencies);
 
-    // Decode data
-    Node* current = root;
     unsigned char bit_buffer = 0;
     int bit_pos = 0;
     int buffer_size = 0;
 
-    unsigned long long decoded = 0;
-    while (decoded < input_size) {
+    Node* current = root;
+    size_t processed = 0;
+
+    while (1) {
         int bit = read_bit(in, &bit_buffer, &bit_pos, &buffer_size);
-        if (bit == -1) // EOF
-            break;
+        if (bit == -1) break;
 
         current = bit ? current->right : current->left;
 
         if (!current->left && !current->right) {
             fwrite(&current->symbol, 1, 1, out);
             current = root;
-            decoded++;
+            processed++;
 
-            if (decoded % 1024 == 0 || decoded == input_size) {
-                show_progress(decoded, input_size, "Decompressing");
+            // Show progress
+            if (processed % (CHUNK_SIZE / 100) == 0) {
+                show_progress("Decompressing", processed, CHUNK_SIZE);
             }
         }
     }
 
-    printf("\n");
     free_huffman_tree(root);
+
     fclose(in);
     fclose(out);
+    printf("\nDecompression Complete.\n");
 }
 
 // Free the Huffman tree
@@ -316,7 +356,8 @@ int main(int argc, char** argv) {
     } else if (strcmp(argv[1], "decompress") == 0) {
         decompress_file(argv[2], argv[3]);
     } else {
-        printf("Unknown command: %s\n", argv[1]);
+        fprintf(stderr, "Unknown command: %s\n", argv[1]);
+        return 1;
     }
 
     return 0;
